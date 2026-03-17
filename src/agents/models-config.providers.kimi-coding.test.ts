@@ -3,23 +3,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { captureEnv } from "../test-utils/env.js";
-import { resolveImplicitProvidersForTest } from "./models-config.e2e-harness.js";
+import {
+  resolveImplicitProvidersForTest,
+  withApiKeyProviders,
+} from "./models-config.e2e-harness.js";
 import { buildKimiCodingProvider } from "./models-config.providers.js";
 
 describe("Kimi implicit provider (#22409)", () => {
   it("should include Kimi when KIMI_API_KEY is configured", async () => {
-    const agentDir = mkdtempSync(join(tmpdir(), "openclaw-test-"));
-    const envSnapshot = captureEnv(["KIMI_API_KEY"]);
-    process.env.KIMI_API_KEY = "test-key"; // pragma: allowlist secret
-
-    try {
-      const providers = await resolveImplicitProvidersForTest({ agentDir });
+    await withApiKeyProviders({ KIMI_API_KEY: "test-key" }, (providers) => {
+      // pragma: allowlist secret
       expect(providers?.kimi).toBeDefined();
       expect(providers?.kimi?.api).toBe("anthropic-messages");
       expect(providers?.kimi?.baseUrl).toBe("https://api.kimi.com/coding/");
-    } finally {
-      envSnapshot.restore();
-    }
+    });
   });
 
   it("should build Kimi provider with anthropic-messages API", () => {
@@ -49,7 +46,7 @@ describe("Kimi implicit provider (#22409)", () => {
   it("uses explicit legacy kimi-coding baseUrl when provided", async () => {
     const agentDir = mkdtempSync(join(tmpdir(), "openclaw-test-"));
     const envSnapshot = captureEnv(["KIMI_API_KEY"]);
-    process.env.KIMI_API_KEY = "test-key";
+    process.env.KIMI_API_KEY = "test-key"; // pragma: allowlist secret
 
     try {
       const providers = await resolveImplicitProvidersForTest({
@@ -71,7 +68,7 @@ describe("Kimi implicit provider (#22409)", () => {
   it("merges explicit legacy kimi-coding headers on top of the built-in user agent", async () => {
     const agentDir = mkdtempSync(join(tmpdir(), "openclaw-test-"));
     const envSnapshot = captureEnv(["KIMI_API_KEY"]);
-    process.env.KIMI_API_KEY = "test-key";
+    process.env.KIMI_API_KEY = "test-key"; // pragma: allowlist secret
 
     try {
       const providers = await resolveImplicitProvidersForTest({

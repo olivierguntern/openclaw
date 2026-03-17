@@ -1,6 +1,10 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, vi } from "vitest";
 import { withTempHome as withTempHomeBase } from "../../test/helpers/temp-home.js";
 import type { OpenClawConfig } from "../config/config.js";
+import { captureEnv } from "../test-utils/env.js";
 import type { MockFn } from "../test-utils/vitest-mock-fn.js";
 import { resolveImplicitProviders } from "./models-config.providers.js";
 
@@ -148,6 +152,53 @@ export async function resolveImplicitProvidersForTest(
     ...params,
     env: snapshotImplicitProviderEnv(params.env),
   });
+}
+
+/**
+ * Test helper that reduces the boilerplate common to provider API-key tests:
+ *
+ * 1. Creates a temporary agent directory.
+ * 2. Captures and restores the named env vars around the test.
+ * 3. Applies `envValues` to `process.env`.
+ * 4. Calls `resolveImplicitProvidersForTest` and passes the result to `fn`.
+ *
+ * Before:
+ * ```ts
+ * const agentDir = mkdtempSync(join(tmpdir(), "openclaw-test-"));
+ * const snap = captureEnv(["SOME_API_KEY"]);
+ * process.env.SOME_API_KEY = "sk-test";
+ * try {
+ *   const providers = await resolveImplicitProvidersForTest({ agentDir });
+ *   expect(providers?.some).toBeDefined();
+ * } finally { snap.restore(); }
+ * ```
+ *
+ * After:
+ * ```ts
+ * await withApiKeyProviders({ SOME_API_KEY: "sk-test" }, (providers) => {
+ *   expect(providers?.some).toBeDefined();
+ * });
+ * ```
+ */
+export async function withApiKeyProviders<T>(
+  envValues: Record<string, string>,
+  fn: (
+    providers: Awaited<ReturnType<typeof resolveImplicitProvidersForTest>>,
+    agentDir: string,
+  ) => T | Promise<T>,
+  extraParams?: Omit<Parameters<typeof resolveImplicitProviders>[0], "agentDir">,
+): Promise<T> {
+  const agentDir = mkdtempSync(join(tmpdir(), "openclaw-test-"));
+  const snap = captureEnv(Object.keys(envValues));
+  for (const [key, value] of Object.entries(envValues)) {
+    process.env[key] = value;
+  }
+  try {
+    const providers = await resolveImplicitProvidersForTest({ agentDir, ...extraParams });
+    return await fn(providers, agentDir);
+  } finally {
+    snap.restore();
+  }
 }
 
 export const CUSTOM_PROXY_MODELS_CONFIG: OpenClawConfig = {

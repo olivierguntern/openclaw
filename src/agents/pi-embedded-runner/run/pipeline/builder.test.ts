@@ -90,6 +90,39 @@ describe("StreamPipelineBuilder / pipeline()", () => {
     expect(result.activeStages).toEqual(["always", "conditional", "last"]);
   });
 
+  it("pipeEach() adds all non-null stages from the array", () => {
+    const base = makeBaseFn();
+    const result = pipeline(base)
+      .pipeEach([
+        { name: "a", wrap: (fn) => fn },
+        null,
+        { name: "b", wrap: (fn) => fn },
+        undefined,
+        { name: "c", wrap: (fn) => fn },
+      ])
+      .build();
+    expect(result.activeStages).toEqual(["a", "b", "c"]);
+  });
+
+  it("pipeEach() with all-null array adds no stages", () => {
+    const base = makeBaseFn();
+    const result = pipeline(base).pipeEach([null, null, undefined]).build();
+    expect(result.activeStages).toEqual([]);
+  });
+
+  it("pipeEach() stages are ordered correctly relative to pipe() calls", () => {
+    const base = makeBaseFn();
+    const result = pipeline(base)
+      .pipe("first", (fn) => fn)
+      .pipeEach([
+        { name: "group-a", wrap: (fn) => fn },
+        { name: "group-b", wrap: (fn) => fn },
+      ])
+      .pipe("last", (fn) => fn)
+      .build();
+    expect(result.activeStages).toEqual(["first", "group-a", "group-b", "last"]);
+  });
+
   it("returns a StreamPipelineBuilder from pipeline()", () => {
     const base = makeBaseFn();
     expect(pipeline(base)).toBeInstanceOf(StreamPipelineBuilder);

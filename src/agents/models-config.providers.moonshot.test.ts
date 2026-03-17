@@ -7,7 +7,10 @@ import {
   MOONSHOT_CN_BASE_URL,
 } from "../plugin-sdk/provider-models.js";
 import { captureEnv } from "../test-utils/env.js";
-import { resolveImplicitProvidersForTest } from "./models-config.e2e-harness.js";
+import {
+  resolveImplicitProvidersForTest,
+  withApiKeyProviders,
+} from "./models-config.e2e-harness.js";
 import { applyNativeStreamingUsageCompat } from "./models-config.providers.js";
 import { buildMoonshotProvider } from "./models-config.providers.static.js";
 
@@ -15,7 +18,7 @@ describe("moonshot implicit provider (#33637)", () => {
   it("uses explicit CN baseUrl when provided", async () => {
     const agentDir = mkdtempSync(join(tmpdir(), "openclaw-test-"));
     const envSnapshot = captureEnv(["MOONSHOT_API_KEY"]);
-    process.env.MOONSHOT_API_KEY = "sk-test-cn";
+    process.env.MOONSHOT_API_KEY = "sk-test-cn"; // pragma: allowlist secret
 
     try {
       const providers = await resolveImplicitProvidersForTest({
@@ -50,7 +53,7 @@ describe("moonshot implicit provider (#33637)", () => {
   it("keeps streaming usage opt-in unset before the final compat pass", async () => {
     const agentDir = mkdtempSync(join(tmpdir(), "openclaw-test-"));
     const envSnapshot = captureEnv(["MOONSHOT_API_KEY"]);
-    process.env.MOONSHOT_API_KEY = "sk-test-custom";
+    process.env.MOONSHOT_API_KEY = "sk-test-custom"; // pragma: allowlist secret
 
     try {
       const providers = await resolveImplicitProvidersForTest({
@@ -72,18 +75,12 @@ describe("moonshot implicit provider (#33637)", () => {
   });
 
   it("defaults to .ai baseUrl when no explicit provider", async () => {
-    const agentDir = mkdtempSync(join(tmpdir(), "openclaw-test-"));
-    const envSnapshot = captureEnv(["MOONSHOT_API_KEY"]);
-    process.env.MOONSHOT_API_KEY = "sk-test";
-
-    try {
-      const providers = await resolveImplicitProvidersForTest({ agentDir });
+    await withApiKeyProviders({ MOONSHOT_API_KEY: "sk-test" }, (providers) => {
+      // pragma: allowlist secret
       expect(providers?.moonshot).toBeDefined();
       expect(providers?.moonshot?.baseUrl).toBe(MOONSHOT_AI_BASE_URL);
       expect(providers?.moonshot?.models?.[0]?.compat?.supportsUsageInStreaming).toBeUndefined();
-    } finally {
-      envSnapshot.restore();
-    }
+    });
   });
 
   it("opts native Moonshot baseUrls into streaming usage only after the final compat pass", () => {

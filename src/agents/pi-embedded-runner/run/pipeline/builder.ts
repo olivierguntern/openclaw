@@ -40,6 +40,24 @@ export class StreamPipelineBuilder {
   }
 
   /**
+   * Appends a batch of pre-built named stages, skipping null/undefined entries.
+   * Use this to insert a group of provider-specific stages in one call:
+   *
+   *   .pipeEach(resolveOpenAIStages({ isResponsesApi }))
+   *
+   * Null/undefined entries in the array are silently ignored, matching the
+   * behaviour of `pipeIf()` with a falsy condition.
+   */
+  pipeEach(stages: ReadonlyArray<NamedStage | null | undefined>): this {
+    for (const s of stages) {
+      if (s) {
+        this.stages.push(s);
+      }
+    }
+    return this;
+  }
+
+  /**
    * Builds the composed StreamFn.
    * The returned function exposes `activeStages` listing every stage name
    * that was added (in application order).
