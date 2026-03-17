@@ -2,20 +2,24 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../../config/config.js";
 import { resolveOllamaBaseUrlForRun } from "../../ollama-stream.js";
 import {
+  isOllamaCompatProvider,
+  resolveOllamaCompatNumCtxEnabled,
+  shouldInjectOllamaCompatNumCtx,
+  wrapOllamaCompatNumCtx,
+} from "./ollama-compat-numctx.js";
+import {
   buildAfterTurnRuntimeContext,
   composeSystemPromptWithHookContext,
-  isOllamaCompatProvider,
   prependSystemPromptAddition,
   resolveAttemptFsWorkspaceOnly,
-  resolveOllamaCompatNumCtxEnabled,
   resolvePromptBuildHookResult,
   resolvePromptModeForSession,
-  shouldInjectOllamaCompatNumCtx,
+} from "./run-setup.js";
+import { wrapStreamFnTrimToolCallNames } from "./tool-name-dispatch.js";
+import {
   decodeHtmlEntitiesInObject,
-  wrapOllamaCompatNumCtx,
   wrapStreamFnRepairMalformedToolCallArguments,
-  wrapStreamFnTrimToolCallNames,
-} from "./attempt.js";
+} from "./tool-call-repair.js";
 
 type FakeWrappedStream = {
   result: () => Promise<unknown>;
