@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { streamSimple } from "@mariozechner/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -43,7 +42,6 @@ import {
   listChannelSupportedActions,
   resolveChannelMessageToolHints,
 } from "../../channel-tools.js";
-import { ensureCustomApiRegistered } from "../../custom-api-registry.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../defaults.js";
 import { resolveOpenClawDocsPath } from "../../docs-path.js";
 import { isTimeoutError } from "../../failover-error.js";
@@ -51,12 +49,10 @@ import { resolveImageSanitizationLimits } from "../../image-sanitization.js";
 import { resolveModelAuthMode } from "../../model-auth.js";
 import { resolveDefaultModelForAgent } from "../../model-selection.js";
 import { supportsModelTools } from "../../model-tool-support.js";
-import { createConfiguredOllamaStreamFn } from "../../ollama-stream.js";
-import { createOpenAIWebSocketStreamFn, releaseWsSession } from "../../openai-ws-stream.js";
+import { releaseWsSession } from "../../openai-ws-stream.js";
 import { resolveOwnerDisplaySetting } from "../../owner-display.js";
 import { createBundleMcpToolRuntime } from "../../pi-bundle-mcp-tools.js";
 import {
-  downgradeOpenAIFunctionCallReasoningPairs,
   isCloudCodeAssistFormatError,
   resolveBootstrapMaxChars,
   resolveBootstrapPromptTruncationWarningMode,
@@ -87,7 +83,6 @@ import {
 } from "../../skills.js";
 import { buildSystemPromptParams } from "../../system-prompt-params.js";
 import { buildSystemPromptReport } from "../../system-prompt-report.js";
-import { sanitizeToolCallIdsForCloudCodeAssist } from "../../tool-call-id.js";
 import { resolveTranscriptPolicy } from "../../transcript-policy.js";
 import { DEFAULT_BOOTSTRAP_FILENAME } from "../../workspace.js";
 import { isRunnerAbortError } from "../abort.js";
@@ -118,7 +113,6 @@ import {
   buildEmbeddedSystemPrompt,
   createSystemPromptOverride,
 } from "../system-prompt.js";
-import { dropThinkingBlocks } from "../thinking.js";
 import { collectAllowedToolNames } from "../tool-name-allowlist.js";
 import { installToolResultContextGuard } from "../tool-result-context-guard.js";
 import { splitSdkTools } from "../tool-split.js";
@@ -139,11 +133,18 @@ import {
   wrapOllamaCompatNumCtx,
 } from "./ollama-compat-numctx.js";
 import {
-  createYieldAbortedResponse,
   persistSessionsYieldContextMessage,
   queueSessionsYieldInterruptMessage,
   stripSessionsYieldArtifacts,
 } from "./sessions-yield.js";
+import {
+  buildStreamPipeline,
+  wrapStreamFnDropThinkingBlocks,
+  wrapStreamFnDowngradeOpenAIReasoningPairs,
+  wrapStreamFnSanitizeToolCallIds,
+  wrapStreamFnYieldAbortGuard,
+} from "./pipeline/index.js";
+import { resolveProviderStreamFn } from "./providers/index.js";
 import {
   buildAfterTurnRuntimeContext,
   composeSystemPromptWithHookContext,
@@ -689,33 +690,15 @@ export async function runEmbeddedAttempt(
         workspaceDir: params.workspaceDir,
       });
 
-      // Ollama native API: bypass SDK's streamSimple and use direct /api/chat calls
-      // for reliable streaming + tool calling support (#11828).
-      if (params.model.api === "ollama") {
-        // Prioritize configured provider baseUrl so Docker/remote Ollama hosts work reliably.
-        const providerConfig = params.config?.models?.providers?.[params.model.provider];
-        const providerBaseUrl =
-          typeof providerConfig?.baseUrl === "string" ? providerConfig.baseUrl : undefined;
-        const ollamaStreamFn = createConfiguredOllamaStreamFn({
-          model: params.model,
-          providerBaseUrl,
-        });
-        activeSession.agent.streamFn = ollamaStreamFn;
-        ensureCustomApiRegistered(params.model.api, ollamaStreamFn);
-      } else if (params.model.api === "openai-responses" && params.provider === "openai") {
-        const wsApiKey = await params.authStorage.getApiKey(params.provider);
-        if (wsApiKey) {
-          activeSession.agent.streamFn = createOpenAIWebSocketStreamFn(wsApiKey, params.sessionId, {
-            signal: runAbortController.signal,
-          });
-        } else {
-          log.warn(`[ws-stream] no API key for provider=${params.provider}; using HTTP transport`);
-          activeSession.agent.streamFn = streamSimple;
-        }
-      } else {
-        // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
-        activeSession.agent.streamFn = streamSimple;
-      }
+      // Resolve base stream function for this provider/model combination.
+      activeSession.agent.streamFn = await resolveProviderStreamFn({
+        model: params.model,
+        provider: params.provider,
+        config: params.config,
+        authStorage: params.authStorage,
+        sessionId: params.sessionId,
+        abortSignal: runAbortController.signal,
+      });
 
       // Ollama with OpenAI-compatible API needs num_ctx in payload.options.
       // Otherwise Ollama defaults to a 4096 context window.
@@ -728,15 +711,14 @@ export async function runEmbeddedAttempt(
         config: params.config,
         providerId: providerIdForNumCtx,
       });
-      if (shouldInjectNumCtx) {
-        const numCtx = Math.max(
-          1,
-          Math.floor(
-            params.model.contextWindow ?? params.model.maxTokens ?? DEFAULT_CONTEXT_TOKENS,
-          ),
-        );
-        activeSession.agent.streamFn = wrapOllamaCompatNumCtx(activeSession.agent.streamFn, numCtx);
-      }
+      const numCtx = shouldInjectNumCtx
+        ? Math.max(
+            1,
+            Math.floor(
+              params.model.contextWindow ?? params.model.maxTokens ?? DEFAULT_CONTEXT_TOKENS,
+            ),
+          )
+        : 0;
 
       applyExtraParamsToAgent(
         activeSession.agent,
@@ -757,121 +739,53 @@ export async function runEmbeddedAttempt(
           system: systemPromptText,
           note: "after session create",
         });
-        activeSession.agent.streamFn = cacheTrace.wrapStreamFn(activeSession.agent.streamFn);
       }
 
-      // Anthropic Claude endpoints can reject replayed `thinking` blocks
-      // (e.g. thinkingSignature:"reasoning_text") on any follow-up provider
-      // call, including tool continuations. Wrap the stream function so every
-      // outbound request sees sanitized messages.
-      if (transcriptPolicy.dropThinkingBlocks) {
-        const inner = activeSession.agent.streamFn;
-        activeSession.agent.streamFn = (model, context, options) => {
-          const ctx = context as unknown as { messages?: unknown };
-          const messages = ctx?.messages;
-          if (!Array.isArray(messages)) {
-            return inner(model, context, options);
-          }
-          const sanitized = dropThinkingBlocks(messages as unknown as AgentMessage[]) as unknown;
-          if (sanitized === messages) {
-            return inner(model, context, options);
-          }
-          const nextContext = {
-            ...(context as unknown as Record<string, unknown>),
-            messages: sanitized,
-          } as unknown;
-          return inner(model, nextContext as typeof context, options);
-        };
-      }
-
-      // Mistral (and other strict providers) reject tool call IDs that don't match their
-      // format requirements (e.g. [a-zA-Z0-9]{9}). sanitizeSessionHistory only processes
-      // historical messages at attempt start, but the agent loop's internal tool call →
-      // tool result cycles bypass that path. Wrap streamFn so every outbound request
-      // sees sanitized tool call IDs.
-      if (transcriptPolicy.sanitizeToolCallIds && transcriptPolicy.toolCallIdMode) {
-        const inner = activeSession.agent.streamFn;
-        const mode = transcriptPolicy.toolCallIdMode;
-        activeSession.agent.streamFn = (model, context, options) => {
-          const ctx = context as unknown as { messages?: unknown };
-          const messages = ctx?.messages;
-          if (!Array.isArray(messages)) {
-            return inner(model, context, options);
-          }
-          const sanitized = sanitizeToolCallIdsForCloudCodeAssist(messages as AgentMessage[], mode);
-          if (sanitized === messages) {
-            return inner(model, context, options);
-          }
-          const nextContext = {
-            ...(context as unknown as Record<string, unknown>),
-            messages: sanitized,
-          } as unknown;
-          return inner(model, nextContext as typeof context, options);
-        };
-      }
-
-      if (
-        params.model.api === "openai-responses" ||
-        params.model.api === "openai-codex-responses"
-      ) {
-        const inner = activeSession.agent.streamFn;
-        activeSession.agent.streamFn = (model, context, options) => {
-          const ctx = context as unknown as { messages?: unknown };
-          const messages = ctx?.messages;
-          if (!Array.isArray(messages)) {
-            return inner(model, context, options);
-          }
-          const sanitized = downgradeOpenAIFunctionCallReasoningPairs(messages as AgentMessage[]);
-          if (sanitized === messages) {
-            return inner(model, context, options);
-          }
-          const nextContext = {
-            ...(context as unknown as Record<string, unknown>),
-            messages: sanitized,
-          } as unknown;
-          return inner(model, nextContext as typeof context, options);
-        };
-      }
-
-      const innerStreamFn = activeSession.agent.streamFn;
-      activeSession.agent.streamFn = (model, context, options) => {
-        const signal = runAbortController.signal as AbortSignal & { reason?: unknown };
-        if (yieldDetected && signal.aborted && signal.reason === "sessions_yield") {
-          return createYieldAbortedResponse(model) as unknown as Awaited<
-            ReturnType<typeof innerStreamFn>
-          >;
-        }
-        return innerStreamFn(model, context, options);
+      const isOpenAIResponsesApi =
+        params.model.api === "openai-responses" || params.model.api === "openai-codex-responses";
+      const abortSignalWithReason = runAbortController.signal as AbortSignal & {
+        reason?: unknown;
       };
 
-      // Some models emit tool names with surrounding whitespace (e.g. " read ").
-      // pi-agent-core dispatches tool calls with exact string matching, so normalize
-      // names on the live response stream before tool execution.
-      activeSession.agent.streamFn = wrapStreamFnTrimToolCallNames(
-        activeSession.agent.streamFn,
-        allowedToolNames,
-      );
-
-      if (
+      // Compose the stream pipeline declaratively. Stages are applied in order;
+      // null entries are skipped so conditional stages stay readable.
+      activeSession.agent.streamFn = buildStreamPipeline(activeSession.agent.streamFn, [
+        // Ollama OpenAI-compat: inject num_ctx so context window is respected.
+        shouldInjectNumCtx ? (fn) => wrapOllamaCompatNumCtx(fn, numCtx) : null,
+        // Cache tracing: wrap after num_ctx so payload logs reflect the final request.
+        cacheTrace ? (fn) => cacheTrace.wrapStreamFn(fn) : null,
+        // Drop Anthropic thinking blocks that would be rejected on follow-up calls.
+        transcriptPolicy.dropThinkingBlocks ? wrapStreamFnDropThinkingBlocks : null,
+        // Sanitize tool call IDs for strict providers (Mistral, Cloud Code Assist).
+        transcriptPolicy.sanitizeToolCallIds && transcriptPolicy.toolCallIdMode
+          ? (fn) => wrapStreamFnSanitizeToolCallIds(fn, transcriptPolicy.toolCallIdMode!)
+          : null,
+        // Remove reasoning-pair artifacts for OpenAI Responses/Codex APIs.
+        isOpenAIResponsesApi ? wrapStreamFnDowngradeOpenAIReasoningPairs : null,
+        // Intercept calls after sessions_yield has aborted the run.
+        (fn) =>
+          wrapStreamFnYieldAbortGuard(fn, {
+            signal: abortSignalWithReason,
+            isYieldAborted: () =>
+              yieldDetected &&
+              abortSignalWithReason.aborted &&
+              abortSignalWithReason.reason === "sessions_yield",
+          }),
+        // Some models emit tool names with surrounding whitespace (e.g. " read ").
+        // pi-agent-core dispatches tool calls with exact string matching.
+        (fn) => wrapStreamFnTrimToolCallNames(fn, allowedToolNames),
+        // Repair malformed Kimi tool call JSON (trailing chars after closing brace).
         params.model.api === "anthropic-messages" &&
         shouldRepairMalformedAnthropicToolCallArguments(params.provider)
-      ) {
-        activeSession.agent.streamFn = wrapStreamFnRepairMalformedToolCallArguments(
-          activeSession.agent.streamFn,
-        );
-      }
-
-      if (isXaiProvider(params.provider, params.modelId)) {
-        activeSession.agent.streamFn = wrapStreamFnDecodeXaiToolCallArguments(
-          activeSession.agent.streamFn,
-        );
-      }
-
-      if (anthropicPayloadLogger) {
-        activeSession.agent.streamFn = anthropicPayloadLogger.wrapStreamFn(
-          activeSession.agent.streamFn,
-        );
-      }
+          ? wrapStreamFnRepairMalformedToolCallArguments
+          : null,
+        // Decode HTML entities emitted by xAI/Grok in tool call arguments.
+        isXaiProvider(params.provider, params.modelId)
+          ? wrapStreamFnDecodeXaiToolCallArguments
+          : null,
+        // Anthropic payload logger (debug/tracing, opt-in via env).
+        anthropicPayloadLogger ? (fn) => anthropicPayloadLogger.wrapStreamFn(fn) : null,
+      ]);
 
       try {
         const prior = await sanitizeSessionHistory({
