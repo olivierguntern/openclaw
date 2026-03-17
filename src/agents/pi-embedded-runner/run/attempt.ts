@@ -8,7 +8,6 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
-import type { OpenClawConfig } from "../../../config/config.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
 import {
   ensureGlobalUndiciEnvProxyDispatcher,
@@ -127,18 +126,9 @@ import {
 } from "./compaction-timeout.js";
 import { pruneProcessedHistoryImages } from "./history-image-prune.js";
 import { detectAndLoadPromptImages } from "./images.js";
-import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
+import { shouldInjectOllamaCompatNumCtx, wrapOllamaCompatNumCtx } from "./ollama-compat-numctx.js";
+import { pipeline } from "./pipeline/builder.js";
 import {
-  shouldInjectOllamaCompatNumCtx,
-  wrapOllamaCompatNumCtx,
-} from "./ollama-compat-numctx.js";
-import {
-  persistSessionsYieldContextMessage,
-  queueSessionsYieldInterruptMessage,
-  stripSessionsYieldArtifacts,
-} from "./sessions-yield.js";
-import {
-  buildStreamPipeline,
   wrapStreamFnDropThinkingBlocks,
   wrapStreamFnDowngradeOpenAIReasoningPairs,
   wrapStreamFnSanitizeToolCallIds,
@@ -154,13 +144,19 @@ import {
   resolvePromptModeForSession,
   summarizeSessionContext,
 } from "./run-setup.js";
-import { wrapStreamFnTrimToolCallNames } from "./tool-name-dispatch.js";
+import {
+  persistSessionsYieldContextMessage,
+  queueSessionsYieldInterruptMessage,
+  stripSessionsYieldArtifacts,
+} from "./sessions-yield.js";
 import {
   MAX_BTW_SNAPSHOT_MESSAGES,
   shouldRepairMalformedAnthropicToolCallArguments,
   wrapStreamFnDecodeXaiToolCallArguments,
   wrapStreamFnRepairMalformedToolCallArguments,
 } from "./tool-call-repair.js";
+import { wrapStreamFnTrimToolCallNames } from "./tool-name-dispatch.js";
+import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 
 export async function runEmbeddedAttempt(
   params: EmbeddedRunAttemptParams,
@@ -747,23 +743,33 @@ export async function runEmbeddedAttempt(
         reason?: unknown;
       };
 
-      // Compose the stream pipeline declaratively. Stages are applied in order;
-      // null entries are skipped so conditional stages stay readable.
-      activeSession.agent.streamFn = buildStreamPipeline(activeSession.agent.streamFn, [
+      // Compose the stream pipeline using the fluent builder. Active stages are
+      // logged at debug level so pipeline composition is visible in traces.
+      const streamPipeline = pipeline(activeSession.agent.streamFn)
         // Ollama OpenAI-compat: inject num_ctx so context window is respected.
-        shouldInjectNumCtx ? (fn) => wrapOllamaCompatNumCtx(fn, numCtx) : null,
+        .pipeIf(shouldInjectNumCtx, "ollama:num-ctx", (fn) => wrapOllamaCompatNumCtx(fn, numCtx))
         // Cache tracing: wrap after num_ctx so payload logs reflect the final request.
-        cacheTrace ? (fn) => cacheTrace.wrapStreamFn(fn) : null,
+        .pipeIf(!!cacheTrace, "cache-trace", (fn) => cacheTrace!.wrapStreamFn(fn))
         // Drop Anthropic thinking blocks that would be rejected on follow-up calls.
-        transcriptPolicy.dropThinkingBlocks ? wrapStreamFnDropThinkingBlocks : null,
+        .pipeIf(
+          transcriptPolicy.dropThinkingBlocks,
+          "drop-thinking-blocks",
+          wrapStreamFnDropThinkingBlocks,
+        )
         // Sanitize tool call IDs for strict providers (Mistral, Cloud Code Assist).
-        transcriptPolicy.sanitizeToolCallIds && transcriptPolicy.toolCallIdMode
-          ? (fn) => wrapStreamFnSanitizeToolCallIds(fn, transcriptPolicy.toolCallIdMode!)
-          : null,
+        .pipeIf(
+          !!(transcriptPolicy.sanitizeToolCallIds && transcriptPolicy.toolCallIdMode),
+          "sanitize-tool-call-ids",
+          (fn) => wrapStreamFnSanitizeToolCallIds(fn, transcriptPolicy.toolCallIdMode!),
+        )
         // Remove reasoning-pair artifacts for OpenAI Responses/Codex APIs.
-        isOpenAIResponsesApi ? wrapStreamFnDowngradeOpenAIReasoningPairs : null,
+        .pipeIf(
+          isOpenAIResponsesApi,
+          "downgrade-openai-reasoning",
+          wrapStreamFnDowngradeOpenAIReasoningPairs,
+        )
         // Intercept calls after sessions_yield has aborted the run.
-        (fn) =>
+        .pipe("yield-abort-guard", (fn) =>
           wrapStreamFnYieldAbortGuard(fn, {
             signal: abortSignalWithReason,
             isYieldAborted: () =>
@@ -771,21 +777,30 @@ export async function runEmbeddedAttempt(
               abortSignalWithReason.aborted &&
               abortSignalWithReason.reason === "sessions_yield",
           }),
+        )
         // Some models emit tool names with surrounding whitespace (e.g. " read ").
         // pi-agent-core dispatches tool calls with exact string matching.
-        (fn) => wrapStreamFnTrimToolCallNames(fn, allowedToolNames),
+        .pipe("trim-tool-names", (fn) => wrapStreamFnTrimToolCallNames(fn, allowedToolNames))
         // Repair malformed Kimi tool call JSON (trailing chars after closing brace).
-        params.model.api === "anthropic-messages" &&
-        shouldRepairMalformedAnthropicToolCallArguments(params.provider)
-          ? wrapStreamFnRepairMalformedToolCallArguments
-          : null,
+        .pipeIf(
+          params.model.api === "anthropic-messages" &&
+            shouldRepairMalformedAnthropicToolCallArguments(params.provider),
+          "repair-kimi-tool-calls",
+          wrapStreamFnRepairMalformedToolCallArguments,
+        )
         // Decode HTML entities emitted by xAI/Grok in tool call arguments.
-        isXaiProvider(params.provider, params.modelId)
-          ? wrapStreamFnDecodeXaiToolCallArguments
-          : null,
+        .pipeIf(
+          isXaiProvider(params.provider, params.modelId),
+          "decode-xai-entities",
+          wrapStreamFnDecodeXaiToolCallArguments,
+        )
         // Anthropic payload logger (debug/tracing, opt-in via env).
-        anthropicPayloadLogger ? (fn) => anthropicPayloadLogger.wrapStreamFn(fn) : null,
-      ]);
+        .pipeIf(!!anthropicPayloadLogger, "anthropic-payload-logger", (fn) =>
+          anthropicPayloadLogger!.wrapStreamFn(fn),
+        )
+        .build();
+      log.debug(`stream pipeline: [${streamPipeline.activeStages.join(" → ")}]`);
+      activeSession.agent.streamFn = streamPipeline;
 
       try {
         const prior = await sanitizeSessionHistory({
