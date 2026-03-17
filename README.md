@@ -125,14 +125,14 @@ pnpm build:parallel
 
 The embedded agent runner (`src/agents/pi-embedded-runner/run/`) is split into focused modules to keep each file under a manageable size:
 
-| File | Responsibility |
-|---|---|
-| `attempt.ts` | Main `runEmbeddedAttempt` orchestration |
-| `sessions-yield.ts` | `sessions_yield` interrupt/context helpers |
-| `ollama-compat-numctx.ts` | Ollama `num_ctx` stream injection |
-| `tool-name-dispatch.ts` | Tool name normalization and stream wrappers |
-| `tool-call-repair.ts` | Malformed tool-call repair and xAI HTML-entity decoding |
-| `run-setup.ts` | Prompt/hook/workspace setup helpers |
+| File                      | Responsibility                                          |
+| ------------------------- | ------------------------------------------------------- |
+| `attempt.ts`              | Main `runEmbeddedAttempt` orchestration                 |
+| `sessions-yield.ts`       | `sessions_yield` interrupt/context helpers              |
+| `ollama-compat-numctx.ts` | Ollama `num_ctx` stream injection                       |
+| `tool-name-dispatch.ts`   | Tool name normalization and stream wrappers             |
+| `tool-call-repair.ts`     | Malformed tool-call repair and xAI HTML-entity decoding |
+| `run-setup.ts`            | Prompt/hook/workspace setup helpers                     |
 
 ## Security defaults (DM access)
 

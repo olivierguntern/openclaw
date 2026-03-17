@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { describe, expect, it, vi } from "vitest";
 import { wrapStreamFnSanitizeToolCallIds } from "./sanitize-tool-call-ids.js";
 
 type FakeStream = {
@@ -30,9 +30,7 @@ async function invokeWrapped(
   });
 
   const wrapped = wrapStreamFnSanitizeToolCallIds(baseFn as never, mode);
-  await Promise.resolve(
-    wrapped({ role: "model" } as never, { messages } as never, {} as never),
-  );
+  await Promise.resolve(wrapped({ role: "model" } as never, { messages } as never, {} as never));
   return capturedMessages;
 }
 
@@ -41,9 +39,7 @@ describe("wrapStreamFnSanitizeToolCallIds", () => {
     const messages: AgentMessage[] = [
       {
         role: "assistant",
-        content: [
-          { type: "toolCall", name: "read", id: "abcdefghi", arguments: {} } as never,
-        ],
+        content: [{ type: "toolCall", name: "read", id: "abcdefghi", arguments: {} } as never],
       },
     ];
 
@@ -89,9 +85,7 @@ describe("wrapStreamFnSanitizeToolCallIds", () => {
   });
 
   it("does not alter user messages that have no tool call IDs", async () => {
-    const messages: AgentMessage[] = [
-      { role: "user", content: [{ type: "text", text: "hello" }] },
-    ];
+    const messages: AgentMessage[] = [{ role: "user", content: [{ type: "text", text: "hello" }] }];
 
     const result = await invokeWrapped(messages, "strict");
 

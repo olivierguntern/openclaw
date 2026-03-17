@@ -1,15 +1,15 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { joinPresentTextSegments } from "../../../shared/text/join-segments.js";
 import type { OpenClawConfig } from "../../../config/config.js";
-import { isCronSessionKey, isSubagentSessionKey } from "../../../routing/session-key.js";
-import { resolveEffectiveToolFsWorkspaceOnly } from "../../tool-fs-policy.js";
-import { log } from "../logger.js";
 import type {
   PluginHookAgentContext,
   PluginHookBeforeAgentStartResult,
   PluginHookBeforePromptBuildResult,
 } from "../../../plugins/types.js";
+import { isCronSessionKey, isSubagentSessionKey } from "../../../routing/session-key.js";
+import { joinPresentTextSegments } from "../../../shared/text/join-segments.js";
+import { resolveEffectiveToolFsWorkspaceOnly } from "../../tool-fs-policy.js";
 import type { CompactEmbeddedPiSessionParams } from "../compact.js";
+import { log } from "../logger.js";
 import type { EmbeddedRunAttemptParams } from "./types.js";
 
 export type PromptBuildHookRunner = {

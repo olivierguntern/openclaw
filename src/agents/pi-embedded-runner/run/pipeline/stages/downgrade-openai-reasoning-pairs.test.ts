@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { describe, expect, it, vi } from "vitest";
 import { wrapStreamFnDowngradeOpenAIReasoningPairs } from "./downgrade-openai-reasoning-pairs.js";
 
 type FakeStream = {
@@ -27,9 +27,7 @@ async function invokeWrapped(messages: AgentMessage[]): Promise<AgentMessage[]> 
   });
 
   const wrapped = wrapStreamFnDowngradeOpenAIReasoningPairs(baseFn as never);
-  await Promise.resolve(
-    wrapped({ role: "model" } as never, { messages } as never, {} as never),
-  );
+  await Promise.resolve(wrapped({ role: "model" } as never, { messages } as never, {} as never));
   return capturedMessages;
 }
 

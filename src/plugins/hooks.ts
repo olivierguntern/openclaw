@@ -682,10 +682,7 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
     for (const hook of hooks) {
       try {
         const out = (
-          hook.handler as (
-            event: unknown,
-            ctx: unknown,
-          ) => PluginHookToolResultPersistResult | void
+          hook.handler as (event: unknown, ctx: unknown) => PluginHookToolResultPersistResult | void
         )({ ...event, message: current }, ctx) as
           | PluginHookToolResultPersistResult
           | void

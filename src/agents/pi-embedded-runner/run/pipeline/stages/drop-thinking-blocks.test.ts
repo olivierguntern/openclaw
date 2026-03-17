@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { describe, expect, it, vi } from "vitest";
 import { wrapStreamFnDropThinkingBlocks } from "./drop-thinking-blocks.js";
 
 type FakeStream = {

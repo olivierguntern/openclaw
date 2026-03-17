@@ -15,11 +15,11 @@ import {
   resolvePromptBuildHookResult,
   resolvePromptModeForSession,
 } from "./run-setup.js";
-import { wrapStreamFnTrimToolCallNames } from "./tool-name-dispatch.js";
 import {
   decodeHtmlEntitiesInObject,
   wrapStreamFnRepairMalformedToolCallArguments,
 } from "./tool-call-repair.js";
+import { wrapStreamFnTrimToolCallNames } from "./tool-name-dispatch.js";
 
 type FakeWrappedStream = {
   result: () => Promise<unknown>;

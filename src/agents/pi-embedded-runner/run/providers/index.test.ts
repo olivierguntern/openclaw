@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
 import type { Api, Model } from "@mariozechner/pi-ai";
 import type { AuthStorage } from "@mariozechner/pi-coding-agent";
+import { describe, expect, it, vi } from "vitest";
 import type { ProviderStreamFnDeps, ProviderStreamFnParams } from "./index.js";
 import { resolveProviderStreamFnCore } from "./index.js";
 
@@ -77,10 +77,7 @@ describe("resolveProviderStreamFnCore", () => {
       const deps = makeDeps({ createOllamaFn: vi.fn(() => ollamaFn) });
       const model = makeModel("ollama", "ollama");
 
-      const fn = await resolveProviderStreamFnCore(
-        makeParams(model, "ollama"),
-        deps,
-      );
+      const fn = await resolveProviderStreamFnCore(makeParams(model, "ollama"), deps);
 
       expect(deps.createOllamaFn).toHaveBeenCalledWith({
         model,
@@ -116,10 +113,7 @@ describe("resolveProviderStreamFnCore", () => {
       const ollamaFn = vi.fn();
       const deps = makeDeps({ createOllamaFn: vi.fn(() => ollamaFn) });
 
-      await resolveProviderStreamFnCore(
-        makeParams(makeModel("ollama", "ollama"), "ollama"),
-        deps,
-      );
+      await resolveProviderStreamFnCore(makeParams(makeModel("ollama", "ollama"), "ollama"), deps);
 
       expect(deps.registerCustomApi).toHaveBeenCalledWith("ollama", ollamaFn);
     });
