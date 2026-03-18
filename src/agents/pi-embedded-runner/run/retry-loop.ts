@@ -1,0 +1,1185 @@
+import { randomBytes } from "node:crypto";
+import fs from "node:fs/promises";
+import type { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
+import type { Api, Model } from "@mariozechner/pi-ai";
+import type { ThinkLevel } from "../../../auto-reply/thinking.js";
+import { computeBackoff, sleepWithAbort, type BackoffPolicy } from "../../../infra/backoff.js";
+import { generateSecureToken } from "../../../infra/secure-random.js";
+import type { HookRunner } from "../../../plugins/hooks.js";
+import type {
+  PluginHookAgentContext,
+  PluginHookBeforeAgentStartResult,
+} from "../../../plugins/types.js";
+import type { ContextEngine } from "../../../context-engine/types.js";
+import {
+  markAuthProfileGood,
+  markAuthProfileUsed,
+  type AuthProfileFailureReason,
+} from "../../auth-profiles.js";
+import type { AuthProfileStore } from "../../auth-profiles/types.js";
+import type { ContextWindowInfo } from "../../context-window-guard.js";
+import { FailoverError, resolveFailoverStatus } from "../../failover-error.js";
+import {
+  coerceToFailoverError,
+  describeFailoverError,
+} from "../../failover-error.js";
+import {
+  applyLocalNoAuthHeaderOverride,
+  type ResolvedProviderAuth,
+} from "../../model-auth.js";
+import {
+  classifyFailoverReason,
+  extractObservedOverflowTokenCount,
+  formatAssistantErrorText,
+  formatBillingErrorMessage,
+  isAuthAssistantError,
+  isBillingAssistantError,
+  isCompactionFailureError,
+  isFailoverAssistantError,
+  isFailoverErrorMessage,
+  isLikelyContextOverflowError,
+  isRateLimitAssistantError,
+  isTimeoutErrorMessage,
+  parseImageDimensionError,
+  parseImageSizeError,
+  pickFallbackThinkingLevel,
+  type FailoverReason,
+} from "../../pi-embedded-helpers.js";
+import { derivePromptTokens, normalizeUsage, type UsageLike } from "../../usage.js";
+import { describeUnknownError } from "../utils.js";
+import { runEmbeddedAttempt } from "./attempt.js";
+import { createFailoverDecisionLogger } from "./failover-observation.js";
+import type { RunEmbeddedPiAgentParams } from "./params.js";
+import { buildEmbeddedRunPayloads } from "./payloads.js";
+import { MAX_OVERFLOW_COMPACTION_ATTEMPTS, resolveMaxRunRetryIterations } from "./retry-policy.js";
+import {
+  sessionLikelyHasOversizedToolResults,
+  truncateOversizedToolResultsInSession,
+} from "../tool-result-truncation.js";
+import type { EmbeddedPiAgentMeta, EmbeddedPiRunResult } from "../types.js";
+import { log } from "../logger.js";
+
+// ---------------------------------------------------------------------------
+// Immutable configuration for the retry loop (built once from setup phase)
+// ---------------------------------------------------------------------------
+
+export type RetryLoopConfig = {
+  params: RunEmbeddedPiAgentParams;
+  started: number;
+  provider: string;
+  modelId: string;
+  /** Original resolved model (before any runtime auth rewrites). */
+  model: Model<Api>;
+  agentDir: string;
+  resolvedWorkspace: string;
+  hookRunner: HookRunner | null;
+  hookCtx: PluginHookAgentContext;
+  legacyBeforeAgentStartResult: PluginHookBeforeAgentStartResult | undefined;
+  contextEngine: ContextEngine;
+  ctxInfo: ContextWindowInfo;
+  authStore: AuthProfileStore;
+  authStorage: AuthStorage;
+  modelRegistry: ModelRegistry;
+  fallbackConfigured: boolean;
+  lockedProfileId: string | undefined;
+  profileCandidates: Array<string | undefined>;
+  isProbeSession: boolean;
+  resolvedToolResultFormat: "markdown" | "plain";
+  initialThinkLevel: ThinkLevel;
+  bootstrapPromptWarningSignaturesSeen: string[];
+};
+
+// ---------------------------------------------------------------------------
+// Mutable state shared between the setup-phase closures and the retry loop.
+// All closures in run.ts that mutate these values operate on this object
+// so that the loop always sees the latest values.
+// ---------------------------------------------------------------------------
+
+export type RetryLoopState = {
+  runtimeModel: Model<Api>;
+  effectiveModel: Model<Api>;
+  thinkLevel: ThinkLevel;
+  profileIndex: number;
+  apiKeyInfo: ResolvedProviderAuth | null;
+  lastProfileId: string | undefined;
+  attemptedThinking: Set<ThinkLevel>;
+};
+
+// ---------------------------------------------------------------------------
+// Closures from the setup phase that capture additional auth state
+// ---------------------------------------------------------------------------
+
+export type RetryLoopHelpers = {
+  /** Rotate to the next available auth profile. Returns false when exhausted. */
+  advanceAuthProfile: () => Promise<boolean>;
+  /**
+   * Attempt a runtime-auth refresh on auth errors.
+   * Returns true if a refresh was performed (loop should retry).
+   */
+  maybeRefreshRuntimeAuthForAuthError: (errorText: string, retried: boolean) => Promise<boolean>;
+  /** Persist an auth-profile failure to the cooldown store when warranted. */
+  maybeMarkAuthProfileFailure: (failure: {
+    profileId?: string;
+    reason?: AuthProfileFailureReason | null;
+    config?: RunEmbeddedPiAgentParams["config"];
+    agentDir?: RunEmbeddedPiAgentParams["agentDir"];
+  }) => Promise<void>;
+};
+
+// ---------------------------------------------------------------------------
+// Loop-only constants (not exported — scope is this module)
+// ---------------------------------------------------------------------------
+
+const OVERLOAD_FAILOVER_BACKOFF_POLICY: BackoffPolicy = {
+  initialMs: 250,
+  maxMs: 1_500,
+  factor: 2,
+  jitter: 0.2,
+};
+
+const ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL = "ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL";
+const ANTHROPIC_MAGIC_STRING_REPLACEMENT =
+  "ANTHROPIC MAGIC STRING TRIGGER REFUSAL (redacted)";
+
+// ---------------------------------------------------------------------------
+// Loop-only utilities (used only by the retry loop and its sub-functions)
+// ---------------------------------------------------------------------------
+
+type UsageAccumulator = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
+  /** Cache fields from the most recent API call (not accumulated). */
+  lastCacheRead: number;
+  lastCacheWrite: number;
+  lastInput: number;
+};
+
+const createUsageAccumulator = (): UsageAccumulator => ({
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  total: 0,
+  lastCacheRead: 0,
+  lastCacheWrite: 0,
+  lastInput: 0,
+});
+
+const hasUsageValues = (
+  usage: ReturnType<typeof normalizeUsage>,
+): usage is NonNullable<ReturnType<typeof normalizeUsage>> =>
+  !!usage &&
+  [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.total].some(
+    (value) => typeof value === "number" && Number.isFinite(value) && value > 0,
+  );
+
+const mergeUsageIntoAccumulator = (
+  target: UsageAccumulator,
+  usage: ReturnType<typeof normalizeUsage>,
+) => {
+  if (!hasUsageValues(usage)) {
+    return;
+  }
+  target.input += usage.input ?? 0;
+  target.output += usage.output ?? 0;
+  target.cacheRead += usage.cacheRead ?? 0;
+  target.cacheWrite += usage.cacheWrite ?? 0;
+  target.total +=
+    usage.total ??
+    (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+  // Track the most recent API call's cache fields for accurate context-size reporting.
+  // Accumulated cache totals inflate context size when there are multiple tool-call round-trips,
+  // since each call reports cacheRead ≈ current_context_size.
+  target.lastCacheRead = usage.cacheRead ?? 0;
+  target.lastCacheWrite = usage.cacheWrite ?? 0;
+  target.lastInput = usage.input ?? 0;
+};
+
+const toNormalizedUsage = (usage: UsageAccumulator) => {
+  const hasUsage =
+    usage.input > 0 ||
+    usage.output > 0 ||
+    usage.cacheRead > 0 ||
+    usage.cacheWrite > 0 ||
+    usage.total > 0;
+  if (!hasUsage) {
+    return undefined;
+  }
+  // Use the LAST API call's cache fields for context-size calculation.
+  // The accumulated cacheRead/cacheWrite inflate context size because each tool-call
+  // round-trip reports cacheRead ≈ current_context_size, and summing N calls gives
+  // N × context_size which gets clamped to contextWindow (e.g. 200k).
+  // See: https://github.com/openclaw/openclaw/issues/13698
+  //
+  // We use lastInput/lastCacheRead/lastCacheWrite (from the most recent API call) for
+  // cache-related fields, but keep accumulated output (total generated text this turn).
+  const lastPromptTokens = usage.lastInput + usage.lastCacheRead + usage.lastCacheWrite;
+  return {
+    input: usage.lastInput || undefined,
+    output: usage.output || undefined,
+    cacheRead: usage.lastCacheRead || undefined,
+    cacheWrite: usage.lastCacheWrite || undefined,
+    total: lastPromptTokens + usage.output || undefined,
+  };
+};
+
+function resolveActiveErrorContext(params: {
+  lastAssistant: { provider?: string; model?: string } | undefined;
+  provider: string;
+  model: string;
+}): { provider: string; model: string } {
+  return {
+    provider: params.lastAssistant?.provider ?? params.provider,
+    model: params.lastAssistant?.model ?? params.model,
+  };
+}
+
+/**
+ * Build agentMeta for error return paths, preserving accumulated usage so that
+ * session totalTokens reflects the actual context size rather than going stale.
+ * Without this, error returns omit usage and the session keeps whatever
+ * totalTokens was set by the previous successful run.
+ */
+function buildErrorAgentMeta(params: {
+  sessionId: string;
+  provider: string;
+  model: string;
+  usageAccumulator: UsageAccumulator;
+  lastRunPromptUsage: ReturnType<typeof normalizeUsage> | undefined;
+  lastAssistant?: { usage?: unknown } | null;
+  /** API-reported total from the most recent call, mirroring the success path correction. */
+  lastTurnTotal?: number;
+}): EmbeddedPiAgentMeta {
+  const usage = toNormalizedUsage(params.usageAccumulator);
+  // Apply the same lastTurnTotal correction the success path uses so
+  // usage.total reflects the API-reported context size, not accumulated totals.
+  if (usage && params.lastTurnTotal && params.lastTurnTotal > 0) {
+    usage.total = params.lastTurnTotal;
+  }
+  const lastCallUsage = params.lastAssistant
+    ? normalizeUsage(params.lastAssistant.usage as UsageLike)
+    : undefined;
+  const promptTokens = derivePromptTokens(params.lastRunPromptUsage);
+  return {
+    sessionId: params.sessionId,
+    provider: params.provider,
+    model: params.model,
+    // Only include usage fields when we have actual data from prior API calls.
+    ...(usage ? { usage } : {}),
+    ...(lastCallUsage ? { lastCallUsage } : {}),
+    ...(promptTokens ? { promptTokens } : {}),
+  };
+}
+
+function createCompactionDiagId(): string {
+  return `ovf-${Date.now().toString(36)}-${generateSecureToken(4)}`;
+}
+
+function scrubAnthropicRefusalMagic(prompt: string): string {
+  if (!prompt.includes(ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL)) {
+    return prompt;
+  }
+  return prompt.replaceAll(
+    ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL,
+    ANTHROPIC_MAGIC_STRING_REPLACEMENT,
+  );
+}
+
+/**
+ * Map a failover reason to an auth-profile failure reason.
+ * Timeouts are transport/model failures, not auth signals, so they do not
+ * persist auth-profile failure state.
+ */
+function resolveAuthProfileFailureReason(
+  failoverReason: FailoverReason | null,
+): AuthProfileFailureReason | null {
+  if (!failoverReason || failoverReason === "timeout") {
+    return null;
+  }
+  return failoverReason;
+}
+
+// ---------------------------------------------------------------------------
+// Main export — the retry loop
+// ---------------------------------------------------------------------------
+
+/**
+ * Execute the embedded-run retry loop.
+ *
+ * All session setup (model resolution, auth profile selection, context engine
+ * init) is done by the caller (`runEmbeddedPiAgent`). This function owns only
+ * the attempt/failover/compaction logic, keeping `run.ts` focused on setup.
+ */
+export async function runRetryLoop(
+  config: RetryLoopConfig,
+  state: RetryLoopState,
+  helpers: RetryLoopHelpers,
+): Promise<EmbeddedPiRunResult> {
+  const {
+    params,
+    started,
+    provider,
+    modelId,
+    model,
+    agentDir,
+    resolvedWorkspace,
+    hookRunner,
+    hookCtx,
+    legacyBeforeAgentStartResult,
+    contextEngine,
+    ctxInfo,
+    authStore,
+    fallbackConfigured,
+    lockedProfileId,
+    profileCandidates,
+    isProbeSession,
+    resolvedToolResultFormat,
+    initialThinkLevel,
+  } = config;
+
+  // Loop-local counters (reset on each call to runRetryLoop)
+  const MAX_RUN_LOOP_ITERATIONS = resolveMaxRunRetryIterations(profileCandidates.length);
+  let overflowCompactionAttempts = 0;
+  let toolResultTruncationAttempted = false;
+  let bootstrapPromptWarningSignaturesSeen = config.bootstrapPromptWarningSignaturesSeen;
+  const usageAccumulator = createUsageAccumulator();
+  let lastRunPromptUsage: ReturnType<typeof normalizeUsage> | undefined;
+  let autoCompactionCount = 0;
+  let runLoopIterations = 0;
+  let overloadFailoverAttempts = 0;
+
+  const maybeBackoffBeforeOverloadFailover = async (reason: FailoverReason | null) => {
+    if (reason !== "overloaded") {
+      return;
+    }
+    overloadFailoverAttempts += 1;
+    const delayMs = computeBackoff(OVERLOAD_FAILOVER_BACKOFF_POLICY, overloadFailoverAttempts);
+    log.warn(
+      `overload backoff before failover for ${provider}/${modelId}: attempt=${overloadFailoverAttempts} delayMs=${delayMs}`,
+    );
+    try {
+      await sleepWithAbort(delayMs, params.abortSignal);
+    } catch (err) {
+      if (params.abortSignal?.aborted) {
+        const abortErr = new Error("Operation aborted", { cause: err });
+        abortErr.name = "AbortError";
+        throw abortErr;
+      }
+      throw err;
+    }
+  };
+
+  // Hoisted so the retry-limit error path can use the most recent API total.
+  let lastTurnTotal: number | undefined;
+  let authRetryPending = false;
+
+  while (true) {
+    if (runLoopIterations >= MAX_RUN_LOOP_ITERATIONS) {
+      const message =
+        `Exceeded retry limit after ${runLoopIterations} attempts ` +
+        `(max=${MAX_RUN_LOOP_ITERATIONS}).`;
+      log.error(
+        `[run-retry-limit] sessionKey=${params.sessionKey ?? params.sessionId} ` +
+          `provider=${provider}/${modelId} attempts=${runLoopIterations} ` +
+          `maxAttempts=${MAX_RUN_LOOP_ITERATIONS}`,
+      );
+      return {
+        payloads: [
+          {
+            text:
+              "Request failed after repeated internal retries. " +
+              "Please try again, or use /new to start a fresh session.",
+            isError: true,
+          },
+        ],
+        meta: {
+          durationMs: Date.now() - started,
+          agentMeta: buildErrorAgentMeta({
+            sessionId: params.sessionId,
+            provider,
+            model: model.id,
+            usageAccumulator,
+            lastRunPromptUsage,
+            lastTurnTotal,
+          }),
+          error: { kind: "retry_limit", message },
+        },
+      };
+    }
+    runLoopIterations += 1;
+    const runtimeAuthRetry = authRetryPending;
+    authRetryPending = false;
+    state.attemptedThinking.add(state.thinkLevel);
+    await fs.mkdir(resolvedWorkspace, { recursive: true });
+
+    const prompt =
+      provider === "anthropic" ? scrubAnthropicRefusalMagic(params.prompt) : params.prompt;
+
+    const attempt = await runEmbeddedAttempt({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      trigger: params.trigger,
+      memoryFlushWritePath: params.memoryFlushWritePath,
+      messageChannel: params.messageChannel,
+      messageProvider: params.messageProvider,
+      agentAccountId: params.agentAccountId,
+      messageTo: params.messageTo,
+      messageThreadId: params.messageThreadId,
+      groupId: params.groupId,
+      groupChannel: params.groupChannel,
+      groupSpace: params.groupSpace,
+      spawnedBy: params.spawnedBy,
+      senderId: params.senderId,
+      senderName: params.senderName,
+      senderUsername: params.senderUsername,
+      senderE164: params.senderE164,
+      senderIsOwner: params.senderIsOwner,
+      currentChannelId: params.currentChannelId,
+      currentThreadTs: params.currentThreadTs,
+      currentMessageId: params.currentMessageId,
+      replyToMode: params.replyToMode,
+      hasRepliedRef: params.hasRepliedRef,
+      sessionFile: params.sessionFile,
+      workspaceDir: resolvedWorkspace,
+      agentDir,
+      config: params.config,
+      allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
+      contextEngine,
+      contextTokenBudget: ctxInfo.tokens,
+      skillsSnapshot: params.skillsSnapshot,
+      prompt,
+      images: params.images,
+      disableTools: params.disableTools,
+      provider,
+      modelId,
+      model: applyLocalNoAuthHeaderOverride(state.effectiveModel, state.apiKeyInfo),
+      authProfileId: state.lastProfileId,
+      authProfileIdSource: lockedProfileId ? "user" : "auto",
+      authStorage: config.authStorage,
+      modelRegistry: config.modelRegistry,
+      agentId: hookCtx.agentId,
+      legacyBeforeAgentStartResult,
+      thinkLevel: state.thinkLevel,
+      fastMode: params.fastMode,
+      verboseLevel: params.verboseLevel,
+      reasoningLevel: params.reasoningLevel,
+      toolResultFormat: resolvedToolResultFormat,
+      execOverrides: params.execOverrides,
+      bashElevated: params.bashElevated,
+      timeoutMs: params.timeoutMs,
+      runId: params.runId,
+      abortSignal: params.abortSignal,
+      shouldEmitToolResult: params.shouldEmitToolResult,
+      shouldEmitToolOutput: params.shouldEmitToolOutput,
+      onPartialReply: params.onPartialReply,
+      onAssistantMessageStart: params.onAssistantMessageStart,
+      onBlockReply: params.onBlockReply,
+      onBlockReplyFlush: params.onBlockReplyFlush,
+      blockReplyBreak: params.blockReplyBreak,
+      blockReplyChunking: params.blockReplyChunking,
+      onReasoningStream: params.onReasoningStream,
+      onReasoningEnd: params.onReasoningEnd,
+      onToolResult: params.onToolResult,
+      onAgentEvent: params.onAgentEvent,
+      extraSystemPrompt: params.extraSystemPrompt,
+      inputProvenance: params.inputProvenance,
+      streamParams: params.streamParams,
+      ownerNumbers: params.ownerNumbers,
+      enforceFinalTag: params.enforceFinalTag,
+      bootstrapPromptWarningSignaturesSeen,
+      bootstrapPromptWarningSignature:
+        bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1],
+    });
+
+    const {
+      aborted,
+      promptError,
+      timedOut,
+      timedOutDuringCompaction,
+      sessionIdUsed,
+      lastAssistant,
+    } = attempt;
+    bootstrapPromptWarningSignaturesSeen =
+      attempt.bootstrapPromptWarningSignaturesSeen ??
+      (attempt.bootstrapPromptWarningSignature
+        ? Array.from(
+            new Set([
+              ...bootstrapPromptWarningSignaturesSeen,
+              attempt.bootstrapPromptWarningSignature,
+            ]),
+          )
+        : bootstrapPromptWarningSignaturesSeen);
+    const lastAssistantUsage = normalizeUsage(lastAssistant?.usage as UsageLike);
+    const attemptUsage = attempt.attemptUsage ?? lastAssistantUsage;
+    mergeUsageIntoAccumulator(usageAccumulator, attemptUsage);
+    // Keep prompt size from the latest model call so session totalTokens
+    // reflects current context usage, not accumulated tool-loop usage.
+    lastRunPromptUsage = lastAssistantUsage ?? attemptUsage;
+    lastTurnTotal = lastAssistantUsage?.total ?? attemptUsage?.total;
+    const attemptCompactionCount = Math.max(0, attempt.compactionCount ?? 0);
+    autoCompactionCount += attemptCompactionCount;
+    const activeErrorContext = resolveActiveErrorContext({
+      lastAssistant,
+      provider,
+      model: modelId,
+    });
+    const formattedAssistantErrorText = lastAssistant
+      ? formatAssistantErrorText(lastAssistant, {
+          cfg: params.config,
+          sessionKey: params.sessionKey ?? params.sessionId,
+          provider: activeErrorContext.provider,
+          model: activeErrorContext.model,
+        })
+      : undefined;
+    const assistantErrorText =
+      lastAssistant?.stopReason === "error"
+        ? lastAssistant.errorMessage?.trim() || formattedAssistantErrorText
+        : undefined;
+
+    const contextOverflowError = !aborted
+      ? (() => {
+          if (promptError) {
+            const errorText = describeUnknownError(promptError);
+            if (isLikelyContextOverflowError(errorText)) {
+              return { text: errorText, source: "promptError" as const };
+            }
+            // Prompt submission failed with a non-overflow error. Do not
+            // inspect prior assistant errors from history for this attempt.
+            return null;
+          }
+          if (assistantErrorText && isLikelyContextOverflowError(assistantErrorText)) {
+            return { text: assistantErrorText, source: "assistantError" as const };
+          }
+          return null;
+        })()
+      : null;
+
+    if (contextOverflowError) {
+      const overflowDiagId = createCompactionDiagId();
+      const errorText = contextOverflowError.text;
+      const msgCount = attempt.messagesSnapshot?.length ?? 0;
+      const observedOverflowTokens = extractObservedOverflowTokenCount(errorText);
+      log.warn(
+        `[context-overflow-diag] sessionKey=${params.sessionKey ?? params.sessionId} ` +
+          `provider=${provider}/${modelId} source=${contextOverflowError.source} ` +
+          `messages=${msgCount} sessionFile=${params.sessionFile} ` +
+          `diagId=${overflowDiagId} compactionAttempts=${overflowCompactionAttempts} ` +
+          `observedTokens=${observedOverflowTokens ?? "unknown"} ` +
+          `error=${errorText.slice(0, 200)}`,
+      );
+      const isCompactionFailure = isCompactionFailureError(errorText);
+      const hadAttemptLevelCompaction = attemptCompactionCount > 0;
+      // If this attempt already compacted (SDK auto-compaction), avoid immediately
+      // running another explicit compaction for the same overflow trigger.
+      if (
+        !isCompactionFailure &&
+        hadAttemptLevelCompaction &&
+        overflowCompactionAttempts < MAX_OVERFLOW_COMPACTION_ATTEMPTS
+      ) {
+        overflowCompactionAttempts++;
+        log.warn(
+          `context overflow persisted after in-attempt compaction (attempt ${overflowCompactionAttempts}/${MAX_OVERFLOW_COMPACTION_ATTEMPTS}); retrying prompt without additional compaction for ${provider}/${modelId}`,
+        );
+        continue;
+      }
+      // Attempt explicit overflow compaction only when this attempt did not
+      // already auto-compact.
+      if (
+        !isCompactionFailure &&
+        !hadAttemptLevelCompaction &&
+        overflowCompactionAttempts < MAX_OVERFLOW_COMPACTION_ATTEMPTS
+      ) {
+        if (log.isEnabled("debug")) {
+          log.debug(
+            `[compaction-diag] decision diagId=${overflowDiagId} branch=compact ` +
+              `isCompactionFailure=${isCompactionFailure} hasOversizedToolResults=unknown ` +
+              `attempt=${overflowCompactionAttempts + 1} maxAttempts=${MAX_OVERFLOW_COMPACTION_ATTEMPTS}`,
+          );
+        }
+        overflowCompactionAttempts++;
+        log.warn(
+          `context overflow detected (attempt ${overflowCompactionAttempts}/${MAX_OVERFLOW_COMPACTION_ATTEMPTS}); attempting auto-compaction for ${provider}/${modelId}`,
+        );
+        let compactResult: Awaited<ReturnType<typeof contextEngine.compact>>;
+        // When the engine owns compaction, hooks are not fired inside
+        // compactEmbeddedPiSessionDirect (which is bypassed). Fire them
+        // here so subscribers (memory extensions, usage trackers) are
+        // notified even on overflow-recovery compactions.
+        const overflowEngineOwnsCompaction = contextEngine.info.ownsCompaction === true;
+        const overflowHookRunner = overflowEngineOwnsCompaction ? hookRunner : null;
+        if (overflowHookRunner?.hasHooks("before_compaction")) {
+          try {
+            await overflowHookRunner.runBeforeCompaction(
+              { messageCount: -1, sessionFile: params.sessionFile },
+              hookCtx,
+            );
+          } catch (hookErr) {
+            log.warn(
+              `before_compaction hook failed during overflow recovery: ${String(hookErr)}`,
+            );
+          }
+        }
+        try {
+          compactResult = await contextEngine.compact({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            sessionFile: params.sessionFile,
+            tokenBudget: ctxInfo.tokens,
+            ...(observedOverflowTokens !== undefined
+              ? { currentTokenCount: observedOverflowTokens }
+              : {}),
+            force: true,
+            compactionTarget: "budget",
+            runtimeContext: {
+              sessionKey: params.sessionKey,
+              messageChannel: params.messageChannel,
+              messageProvider: params.messageProvider,
+              agentAccountId: params.agentAccountId,
+              authProfileId: state.lastProfileId,
+              workspaceDir: resolvedWorkspace,
+              agentDir,
+              config: params.config,
+              skillsSnapshot: params.skillsSnapshot,
+              senderIsOwner: params.senderIsOwner,
+              provider,
+              model: modelId,
+              runId: params.runId,
+              thinkLevel: state.thinkLevel,
+              reasoningLevel: params.reasoningLevel,
+              bashElevated: params.bashElevated,
+              extraSystemPrompt: params.extraSystemPrompt,
+              ownerNumbers: params.ownerNumbers,
+              trigger: "overflow",
+              ...(observedOverflowTokens !== undefined
+                ? { currentTokenCount: observedOverflowTokens }
+                : {}),
+              diagId: overflowDiagId,
+              attempt: overflowCompactionAttempts,
+              maxAttempts: MAX_OVERFLOW_COMPACTION_ATTEMPTS,
+            },
+          });
+        } catch (compactErr) {
+          log.warn(
+            `contextEngine.compact() threw during overflow recovery for ${provider}/${modelId}: ${String(compactErr)}`,
+          );
+          compactResult = { ok: false, compacted: false, reason: String(compactErr) };
+        }
+        if (
+          compactResult.ok &&
+          compactResult.compacted &&
+          overflowHookRunner?.hasHooks("after_compaction")
+        ) {
+          try {
+            await overflowHookRunner.runAfterCompaction(
+              {
+                messageCount: -1,
+                compactedCount: -1,
+                tokenCount: compactResult.result?.tokensAfter,
+                sessionFile: params.sessionFile,
+              },
+              hookCtx,
+            );
+          } catch (hookErr) {
+            log.warn(
+              `after_compaction hook failed during overflow recovery: ${String(hookErr)}`,
+            );
+          }
+        }
+        if (compactResult.compacted) {
+          autoCompactionCount += 1;
+          log.info(`auto-compaction succeeded for ${provider}/${modelId}; retrying prompt`);
+          continue;
+        }
+        log.warn(
+          `auto-compaction failed for ${provider}/${modelId}: ${compactResult.reason ?? "nothing to compact"}`,
+        );
+      }
+      // Fallback: try truncating oversized tool results in the session.
+      // This handles the case where a single tool result exceeds the
+      // context window and compaction cannot reduce it further.
+      if (!toolResultTruncationAttempted) {
+        const contextWindowTokens = ctxInfo.tokens;
+        const hasOversized = attempt.messagesSnapshot
+          ? sessionLikelyHasOversizedToolResults({
+              messages: attempt.messagesSnapshot,
+              contextWindowTokens,
+            })
+          : false;
+
+        if (hasOversized) {
+          if (log.isEnabled("debug")) {
+            log.debug(
+              `[compaction-diag] decision diagId=${overflowDiagId} branch=truncate_tool_results ` +
+                `isCompactionFailure=${isCompactionFailure} hasOversizedToolResults=${hasOversized} ` +
+                `attempt=${overflowCompactionAttempts} maxAttempts=${MAX_OVERFLOW_COMPACTION_ATTEMPTS}`,
+            );
+          }
+          toolResultTruncationAttempted = true;
+          log.warn(
+            `[context-overflow-recovery] Attempting tool result truncation for ${provider}/${modelId} ` +
+              `(contextWindow=${contextWindowTokens} tokens)`,
+          );
+          const truncResult = await truncateOversizedToolResultsInSession({
+            sessionFile: params.sessionFile,
+            contextWindowTokens,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+          });
+          if (truncResult.truncated) {
+            log.info(
+              `[context-overflow-recovery] Truncated ${truncResult.truncatedCount} tool result(s); retrying prompt`,
+            );
+            // Do NOT reset overflowCompactionAttempts here — the global cap must remain
+            // enforced across all iterations to prevent unbounded compaction cycles (OC-65).
+            continue;
+          }
+          log.warn(
+            `[context-overflow-recovery] Tool result truncation did not help: ${truncResult.reason ?? "unknown"}`,
+          );
+        } else if (log.isEnabled("debug")) {
+          log.debug(
+            `[compaction-diag] decision diagId=${overflowDiagId} branch=give_up ` +
+              `isCompactionFailure=${isCompactionFailure} hasOversizedToolResults=${hasOversized} ` +
+              `attempt=${overflowCompactionAttempts} maxAttempts=${MAX_OVERFLOW_COMPACTION_ATTEMPTS}`,
+          );
+        }
+      }
+
+      if (
+        (isCompactionFailure ||
+          overflowCompactionAttempts >= MAX_OVERFLOW_COMPACTION_ATTEMPTS ||
+          toolResultTruncationAttempted) &&
+        log.isEnabled("debug")
+      ) {
+        log.debug(
+          `[compaction-diag] decision diagId=${overflowDiagId} branch=give_up ` +
+            `isCompactionFailure=${isCompactionFailure} hasOversizedToolResults=unknown ` +
+            `attempt=${overflowCompactionAttempts} maxAttempts=${MAX_OVERFLOW_COMPACTION_ATTEMPTS}`,
+        );
+      }
+      const kind = isCompactionFailure ? "compaction_failure" : "context_overflow";
+      return {
+        payloads: [
+          {
+            text:
+              "Context overflow: prompt too large for the model. " +
+              "Try /reset (or /new) to start a fresh session, or use a larger-context model.",
+            isError: true,
+          },
+        ],
+        meta: {
+          durationMs: Date.now() - started,
+          agentMeta: buildErrorAgentMeta({
+            sessionId: sessionIdUsed,
+            provider,
+            model: model.id,
+            usageAccumulator,
+            lastRunPromptUsage,
+            lastAssistant,
+            lastTurnTotal,
+          }),
+          systemPromptReport: attempt.systemPromptReport,
+          error: { kind, message: errorText },
+        },
+      };
+    }
+
+    if (promptError && !aborted) {
+      // Normalize wrapped errors (e.g. abort-wrapped RESOURCE_EXHAUSTED) into
+      // FailoverError so rate-limit classification works even for nested shapes.
+      const normalizedPromptFailover = coerceToFailoverError(promptError, {
+        provider: activeErrorContext.provider,
+        model: activeErrorContext.model,
+        profileId: state.lastProfileId,
+      });
+      const promptErrorDetails = normalizedPromptFailover
+        ? describeFailoverError(normalizedPromptFailover)
+        : describeFailoverError(promptError);
+      const errorText = promptErrorDetails.message || describeUnknownError(promptError);
+      if (await helpers.maybeRefreshRuntimeAuthForAuthError(errorText, runtimeAuthRetry)) {
+        authRetryPending = true;
+        continue;
+      }
+      // Handle role ordering errors with a user-friendly message
+      if (/incorrect role information|roles must alternate/i.test(errorText)) {
+        return {
+          payloads: [
+            {
+              text:
+                "Message ordering conflict - please try again. " +
+                "If this persists, use /new to start a fresh session.",
+              isError: true,
+            },
+          ],
+          meta: {
+            durationMs: Date.now() - started,
+            agentMeta: buildErrorAgentMeta({
+              sessionId: sessionIdUsed,
+              provider,
+              model: model.id,
+              usageAccumulator,
+              lastRunPromptUsage,
+              lastAssistant,
+              lastTurnTotal,
+            }),
+            systemPromptReport: attempt.systemPromptReport,
+            error: { kind: "role_ordering", message: errorText },
+          },
+        };
+      }
+      // Handle image size errors with a user-friendly message (no retry needed)
+      const imageSizeError = parseImageSizeError(errorText);
+      if (imageSizeError) {
+        const maxMb = imageSizeError.maxMb;
+        const maxMbLabel =
+          typeof maxMb === "number" && Number.isFinite(maxMb) ? `${maxMb}` : null;
+        const maxBytesHint = maxMbLabel ? ` (max ${maxMbLabel}MB)` : "";
+        return {
+          payloads: [
+            {
+              text:
+                `Image too large for the model${maxBytesHint}. ` +
+                "Please compress or resize the image and try again.",
+              isError: true,
+            },
+          ],
+          meta: {
+            durationMs: Date.now() - started,
+            agentMeta: buildErrorAgentMeta({
+              sessionId: sessionIdUsed,
+              provider,
+              model: model.id,
+              usageAccumulator,
+              lastRunPromptUsage,
+              lastAssistant,
+              lastTurnTotal,
+            }),
+            systemPromptReport: attempt.systemPromptReport,
+            error: { kind: "image_size", message: errorText },
+          },
+        };
+      }
+      const promptFailoverReason =
+        promptErrorDetails.reason ?? classifyFailoverReason(errorText);
+      const promptProfileFailureReason = resolveAuthProfileFailureReason(promptFailoverReason);
+      await helpers.maybeMarkAuthProfileFailure({
+        profileId: state.lastProfileId,
+        reason: promptProfileFailureReason,
+      });
+      const promptFailoverFailure =
+        promptFailoverReason !== null || isFailoverErrorMessage(errorText);
+      // Capture the failing profile before auth-profile rotation mutates `lastProfileId`.
+      const failedPromptProfileId = state.lastProfileId;
+      const logPromptFailoverDecision = createFailoverDecisionLogger({
+        stage: "prompt",
+        runId: params.runId,
+        rawError: errorText,
+        failoverReason: promptFailoverReason,
+        profileFailureReason: promptProfileFailureReason,
+        provider,
+        model: modelId,
+        profileId: failedPromptProfileId,
+        fallbackConfigured,
+        aborted,
+      });
+      if (
+        promptFailoverFailure &&
+        promptFailoverReason !== "timeout" &&
+        (await helpers.advanceAuthProfile())
+      ) {
+        logPromptFailoverDecision("rotate_profile");
+        await maybeBackoffBeforeOverloadFailover(promptFailoverReason);
+        continue;
+      }
+      const fallbackThinking = pickFallbackThinkingLevel({
+        message: errorText,
+        attempted: state.attemptedThinking,
+      });
+      if (fallbackThinking) {
+        log.warn(
+          `unsupported thinking level for ${provider}/${modelId}; retrying with ${fallbackThinking}`,
+        );
+        state.thinkLevel = fallbackThinking;
+        continue;
+      }
+      // Throw FailoverError for prompt-side failover reasons when fallbacks
+      // are configured so outer model fallback can continue on overload,
+      // rate-limit, auth, or billing failures.
+      if (fallbackConfigured && promptFailoverFailure) {
+        const status = resolveFailoverStatus(promptFailoverReason ?? "unknown");
+        logPromptFailoverDecision("fallback_model", { status });
+        await maybeBackoffBeforeOverloadFailover(promptFailoverReason);
+        throw (
+          normalizedPromptFailover ??
+          new FailoverError(errorText, {
+            reason: promptFailoverReason ?? "unknown",
+            provider,
+            model: modelId,
+            profileId: state.lastProfileId,
+            status: resolveFailoverStatus(promptFailoverReason ?? "unknown"),
+          })
+        );
+      }
+      if (promptFailoverFailure || promptFailoverReason) {
+        logPromptFailoverDecision("surface_error");
+      }
+      throw promptError;
+    }
+
+    const fallbackThinking = pickFallbackThinkingLevel({
+      message: lastAssistant?.errorMessage,
+      attempted: state.attemptedThinking,
+    });
+    if (fallbackThinking && !aborted) {
+      log.warn(
+        `unsupported thinking level for ${provider}/${modelId}; retrying with ${fallbackThinking}`,
+      );
+      state.thinkLevel = fallbackThinking;
+      continue;
+    }
+
+    const authFailure = isAuthAssistantError(lastAssistant);
+    const rateLimitFailure = isRateLimitAssistantError(lastAssistant);
+    const billingFailure = isBillingAssistantError(lastAssistant);
+    const failoverFailure = isFailoverAssistantError(lastAssistant);
+    const assistantFailoverReason = classifyFailoverReason(lastAssistant?.errorMessage ?? "");
+    const assistantProfileFailureReason = resolveAuthProfileFailureReason(assistantFailoverReason);
+    const cloudCodeAssistFormatError = attempt.cloudCodeAssistFormatError;
+    const imageDimensionError = parseImageDimensionError(lastAssistant?.errorMessage ?? "");
+    // Capture the failing profile before auth-profile rotation mutates `lastProfileId`.
+    const failedAssistantProfileId = state.lastProfileId;
+    const logAssistantFailoverDecision = createFailoverDecisionLogger({
+      stage: "assistant",
+      runId: params.runId,
+      rawError: lastAssistant?.errorMessage?.trim(),
+      failoverReason: assistantFailoverReason,
+      profileFailureReason: assistantProfileFailureReason,
+      provider: activeErrorContext.provider,
+      model: activeErrorContext.model,
+      profileId: failedAssistantProfileId,
+      fallbackConfigured,
+      timedOut,
+      aborted,
+    });
+
+    if (
+      authFailure &&
+      (await helpers.maybeRefreshRuntimeAuthForAuthError(
+        lastAssistant?.errorMessage ?? "",
+        runtimeAuthRetry,
+      ))
+    ) {
+      authRetryPending = true;
+      continue;
+    }
+    if (imageDimensionError && state.lastProfileId) {
+      const details = [
+        imageDimensionError.messageIndex !== undefined
+          ? `message=${imageDimensionError.messageIndex}`
+          : null,
+        imageDimensionError.contentIndex !== undefined
+          ? `content=${imageDimensionError.contentIndex}`
+          : null,
+        imageDimensionError.maxDimensionPx !== undefined
+          ? `limit=${imageDimensionError.maxDimensionPx}px`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" ");
+      log.warn(
+        `Profile ${state.lastProfileId} rejected image payload${details ? ` (${details})` : ""}.`,
+      );
+    }
+
+    // Rotate on timeout to try another account/model path in this turn,
+    // but exclude post-prompt compaction timeouts (model succeeded; no profile issue).
+    const shouldRotate =
+      (!aborted && failoverFailure) || (timedOut && !timedOutDuringCompaction);
+
+    if (shouldRotate) {
+      if (state.lastProfileId) {
+        const reason = timedOut ? "timeout" : assistantProfileFailureReason;
+        // Skip cooldown for timeouts: a timeout is model/network-specific,
+        // not an auth issue. Marking the profile would poison fallback models
+        // on the same provider (e.g. gpt-5.3 timeout blocks gpt-5.2).
+        await helpers.maybeMarkAuthProfileFailure({
+          profileId: state.lastProfileId,
+          reason,
+        });
+        if (timedOut && !isProbeSession) {
+          log.warn(`Profile ${state.lastProfileId} timed out. Trying next account...`);
+        }
+        if (cloudCodeAssistFormatError) {
+          log.warn(
+            `Profile ${state.lastProfileId} hit Cloud Code Assist format error. Tool calls will be sanitized on retry.`,
+          );
+        }
+      }
+
+      const rotated = await helpers.advanceAuthProfile();
+      if (rotated) {
+        logAssistantFailoverDecision("rotate_profile");
+        await maybeBackoffBeforeOverloadFailover(assistantFailoverReason);
+        continue;
+      }
+
+      if (fallbackConfigured) {
+        await maybeBackoffBeforeOverloadFailover(assistantFailoverReason);
+        // Prefer formatted error message (user-friendly) over raw errorMessage
+        const message =
+          (lastAssistant
+            ? formatAssistantErrorText(lastAssistant, {
+                cfg: params.config,
+                sessionKey: params.sessionKey ?? params.sessionId,
+                provider: activeErrorContext.provider,
+                model: activeErrorContext.model,
+              })
+            : undefined) ||
+          lastAssistant?.errorMessage?.trim() ||
+          (timedOut
+            ? "LLM request timed out."
+            : rateLimitFailure
+              ? "LLM request rate limited."
+              : billingFailure
+                ? formatBillingErrorMessage(
+                    activeErrorContext.provider,
+                    activeErrorContext.model,
+                  )
+                : authFailure
+                  ? "LLM request unauthorized."
+                  : "LLM request failed.");
+        const status =
+          resolveFailoverStatus(assistantFailoverReason ?? "unknown") ??
+          (isTimeoutErrorMessage(message) ? 408 : undefined);
+        logAssistantFailoverDecision("fallback_model", { status });
+        throw new FailoverError(message, {
+          reason: assistantFailoverReason ?? "unknown",
+          provider: activeErrorContext.provider,
+          model: activeErrorContext.model,
+          profileId: state.lastProfileId,
+          status,
+        });
+      }
+      logAssistantFailoverDecision("surface_error");
+    }
+
+    const usage = toNormalizedUsage(usageAccumulator);
+    if (usage && lastTurnTotal && lastTurnTotal > 0) {
+      usage.total = lastTurnTotal;
+    }
+    // Extract the last individual API call's usage for context-window
+    // utilization display. The accumulated `usage` sums input tokens
+    // across all calls (tool-use loops, compaction retries), which
+    // overstates the actual context size. `lastCallUsage` reflects only
+    // the final call, giving an accurate snapshot of current context.
+    const lastCallUsage = normalizeUsage(lastAssistant?.usage as UsageLike);
+    const promptTokens = derivePromptTokens(lastRunPromptUsage);
+    const agentMeta: EmbeddedPiAgentMeta = {
+      sessionId: sessionIdUsed,
+      provider: lastAssistant?.provider ?? provider,
+      model: lastAssistant?.model ?? model.id,
+      usage,
+      lastCallUsage: lastCallUsage ?? undefined,
+      promptTokens,
+      compactionCount: autoCompactionCount > 0 ? autoCompactionCount : undefined,
+    };
+
+    const payloads = buildEmbeddedRunPayloads({
+      assistantTexts: attempt.assistantTexts,
+      toolMetas: attempt.toolMetas,
+      lastAssistant: attempt.lastAssistant,
+      lastToolError: attempt.lastToolError,
+      config: params.config,
+      sessionKey: params.sessionKey ?? params.sessionId,
+      provider: activeErrorContext.provider,
+      model: activeErrorContext.model,
+      verboseLevel: params.verboseLevel,
+      reasoningLevel: params.reasoningLevel,
+      toolResultFormat: resolvedToolResultFormat,
+      suppressToolErrorWarnings: params.suppressToolErrorWarnings,
+      inlineToolResultsAllowed: false,
+      didSendViaMessagingTool: attempt.didSendViaMessagingTool,
+      didSendDeterministicApprovalPrompt: attempt.didSendDeterministicApprovalPrompt,
+    });
+
+    // Timeout aborts can leave the run without any assistant payloads.
+    // Emit an explicit timeout error instead of silently completing, so
+    // callers do not lose the turn as an orphaned user message.
+    if (timedOut && !timedOutDuringCompaction && payloads.length === 0) {
+      return {
+        payloads: [
+          {
+            text:
+              "Request timed out before a response was generated. " +
+              "Please try again, or increase `agents.defaults.timeoutSeconds` in your config.",
+            isError: true,
+          },
+        ],
+        meta: {
+          durationMs: Date.now() - started,
+          agentMeta,
+          aborted,
+          systemPromptReport: attempt.systemPromptReport,
+        },
+        didSendViaMessagingTool: attempt.didSendViaMessagingTool,
+        didSendDeterministicApprovalPrompt: attempt.didSendDeterministicApprovalPrompt,
+        messagingToolSentTexts: attempt.messagingToolSentTexts,
+        messagingToolSentMediaUrls: attempt.messagingToolSentMediaUrls,
+        messagingToolSentTargets: attempt.messagingToolSentTargets,
+        successfulCronAdds: attempt.successfulCronAdds,
+      };
+    }
+
+    log.debug(
+      `embedded run done: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - started} aborted=${aborted}`,
+    );
+    if (state.lastProfileId) {
+      await markAuthProfileGood({
+        store: authStore,
+        provider,
+        profileId: state.lastProfileId,
+        agentDir: params.agentDir,
+      });
+      await markAuthProfileUsed({
+        store: authStore,
+        profileId: state.lastProfileId,
+        agentDir: params.agentDir,
+      });
+    }
+    return {
+      payloads: payloads.length ? payloads : undefined,
+      meta: {
+        durationMs: Date.now() - started,
+        agentMeta,
+        aborted,
+        systemPromptReport: attempt.systemPromptReport,
+        // Handle client tool calls (OpenResponses hosted tools)
+        // Propagate the LLM stop reason so callers (lifecycle events,
+        // ACP bridge) can distinguish end_turn from max_tokens.
+        stopReason: attempt.clientToolCall
+          ? "tool_calls"
+          : attempt.yieldDetected
+            ? "end_turn"
+            : (lastAssistant?.stopReason as string | undefined),
+        pendingToolCalls: attempt.clientToolCall
+          ? [
+              {
+                id: randomBytes(5).toString("hex").slice(0, 9),
+                name: attempt.clientToolCall.name,
+                arguments: JSON.stringify(attempt.clientToolCall.params),
+              },
+            ]
+          : undefined,
+      },
+      didSendViaMessagingTool: attempt.didSendViaMessagingTool,
+      didSendDeterministicApprovalPrompt: attempt.didSendDeterministicApprovalPrompt,
+      messagingToolSentTexts: attempt.messagingToolSentTexts,
+      messagingToolSentMediaUrls: attempt.messagingToolSentMediaUrls,
+      messagingToolSentTargets: attempt.messagingToolSentTargets,
+      successfulCronAdds: attempt.successfulCronAdds,
+    };
+  }
+}
